@@ -1,0 +1,7 @@
+milo-grid.png
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+.kombai/
+.vscode/
