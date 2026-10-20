@@ -2,6 +2,9 @@ milo-grid.png
 __pycache__/
 *.pyc
 .venv/
+.env
+.env.*
+!.env.example
 .DS_Store
 .kombai/
 .vscode/

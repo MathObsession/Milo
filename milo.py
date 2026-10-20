@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""Milo V0.01: screenshot the main display with a labeled 31x31 grid overlay."""
+"""Milo V0.1.1: screenshot the display, draw a coordinate grid, and locate icons."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 
-GRID_SIZE = 31
-FONT_PATH = "/System/Library/Fonts/SFNS.ttf"
+from gemini import MODEL, GeminiError, locate_icon
+from rendering import draw_grid, draw_highlight
+
+__version__ = "0.1.1"
 
 
 def capture_screen() -> Image.Image:
@@ -35,75 +38,22 @@ def capture_screen() -> Image.Image:
         return Image.open(screenshot_path).convert("RGB")
 
 
-def load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    try:
-        return ImageFont.truetype(FONT_PATH, size)
-    except OSError:
-        return ImageFont.load_default(size=size)
-
-
-def column_label(index: int) -> str:
-    """Convert a 1-based column index to A, B, ..., Z, AA, AB, ..."""
-    label = ""
-    while index > 0:
-        index, remainder = divmod(index - 1, 26)
-        label = chr(ord("A") + remainder) + label
-    return label
-
-
-def draw_grid(image: Image.Image) -> Image.Image:
-    """Overlay a 31x31 grid with spreadsheet-style coordinates."""
-    width, height = image.size
-    draw = ImageDraw.Draw(image)
-    cell_width = width / GRID_SIZE
-    cell_height = height / GRID_SIZE
-    line_width = max(1, round(min(width, height) / 500))
-    line_color = (255, 0, 0)
-    font_size = max(8, round(min(cell_width, cell_height) / 5))
-    font = load_font(font_size)
-    padding = max(1, round(min(cell_width, cell_height) / 36))
-
-    for row in range(GRID_SIZE):
-        for column in range(GRID_SIZE):
-            coordinate = f"{column_label(column + 1)}{row + 1}"
-            left = round(column * cell_width)
-            top = round(row * cell_height)
-            right = round((column + 1) * cell_width)
-            bottom = round((row + 1) * cell_height)
-
-            draw.rectangle(
-                (left, top, right, bottom),
-                outline=line_color,
-                width=line_width,
-            )
-
-            text_box = draw.textbbox((0, 0), coordinate, font=font)
-            text_width = text_box[2] - text_box[0]
-            text_height = text_box[3] - text_box[1]
-            label_left = left + line_width + padding
-            label_top = top + line_width + padding
-            draw.rectangle(
-                (
-                    label_left,
-                    label_top,
-                    label_left + text_width + padding * 2,
-                    label_top + text_height + padding * 2,
-                ),
-                fill=(0, 0, 0),
-            )
-            draw.text(
-                (label_left + padding - text_box[0], label_top + padding - text_box[1]),
-                coordinate,
-                font=font,
-                fill=(255, 255, 255),
-            )
-
-    return image
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Screenshot the main display with a labeled 31x31 grid."
+        description=(
+            "Capture the main display with a 31x31 coordinate grid, optionally "
+            "using Gemini to locate an icon."
+        )
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"Milo {__version__}",
+    )
+    parser.add_argument(
+        "target",
+        nargs="?",
+        help='Icon to locate, for example: "Safari icon".',
     )
     parser.add_argument(
         "-o",
@@ -111,6 +61,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("milo-grid.png"),
         help="Where to save the image (default: milo-grid.png).",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the localization result as JSON.",
     )
     parser.add_argument(
         "--no-open",
@@ -131,12 +86,74 @@ def main() -> int:
         print(f"Milo: {error}", file=sys.stderr)
         return 1
 
-    draw_grid(image).save(output)
-    print(f"Milo: saved {output}")
+    location = None
+
+    if args.target:
+        if not args.json:
+            print(f'Milo: asking {MODEL} to find "{args.target}"...')
+        try:
+            location = locate_icon(image, args.target)
+        except GeminiError as error:
+            print(f"Milo: {error}", file=sys.stderr)
+            draw_grid(image).save(output)
+            return 1
+
+    image = draw_grid(image)
+    if location is not None and location.found and location.coordinate:
+        image = draw_highlight(image, location.coordinate)
+
+    image.save(output)
+
+    if args.json:
+        result = {
+            "target": args.target,
+            "model": MODEL if args.target else None,
+            "found": location.found if location else None,
+            "coordinate": location.coordinate if location else None,
+            "coarse_coordinate": location.coarse_coordinate if location else None,
+            "refined": location.refined if location else None,
+            "confidence": location.confidence if location else None,
+            "description": location.description if location else None,
+            "reasoning": location.reasoning if location else None,
+            "center": (
+                {
+                    "x": location.center[0],
+                    "y": location.center[1],
+                }
+                if location and location.center
+                else None
+            ),
+            "bounding_box": (
+                {
+                    "left": location.bounding_box[0],
+                    "top": location.bounding_box[1],
+                    "right": location.bounding_box[2],
+                    "bottom": location.bounding_box[3],
+                }
+                if location and location.bounding_box
+                else None
+            ),
+            "image": str(output),
+        }
+        print(json.dumps(result, indent=2))
+    elif location is not None:
+        if location.found and location.coordinate:
+            description = f" — {location.description}" if location.description else ""
+            print(
+                f"Milo: {location.coordinate}{description} "
+                f"(confidence {location.confidence:.0%})"
+            )
+        else:
+            print(f'Milo: could not find "{args.target}" in the screenshot.')
+        print(f"Milo: saved {output}")
+    else:
+        print(f"Milo: saved {output}")
 
     if not args.no_open:
         subprocess.run(["open", str(output)], check=False)
 
+    if location is not None and not location.found:
+        return 2
     return 0
 
 
